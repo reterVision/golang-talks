@@ -1,0 +1,176 @@
+Go Runtime Scheduler
+Go Implementation -- Part I
+12 May 2016
+Tags: go golang 
+
+Gao Chao
+@reterclose
+
+* Agenda
+
+- Concepts
+- Some Code
+- Discussion
+
+* Why study runtime
+
+- Go is performant
+- Goroutine
+- How to manage goroutines
+
+* Explanations to
+
+- GOMAXPROCS
+- goroutine numbers in your service
+- goroutine scheduler
+
+* Go scheduler before 1.2
+
+1. Single global mutex (Sched.Lock) and centralized state. The mutex protects all goroutine-related operations (creation, completion, rescheduling, etc).
+2. Goroutine (G) hand-off (G.nextg). Worker threads (M's) frequently hand-off runnable goroutines between each other, this may lead to increased latencies and additional overheads. Every M must be able to execute any runnable G, in particular the M that just created the G.
+3. Per-M memory cache (M.mcache). Memory cache and other caches (stack alloc) are associated with all M's, while they need to be associated only with M's running Go code (an M blocked inside of syscall does not need mcache). A ratio between M's running Go code and all M's can be as high as 1:100. This leads to excessive resource consumption (each MCache can suck up up to 2M) and poor data locality.
+4. Aggressive thread blocking/unblocking. In presence of syscalls worker threads are frequently blocked and unblocked. This adds a lot of overhead.
+
+* Basic Concepts
+
+- G -- Goroutine
+- M -- OS thread
+- P -- Processor (abstracted concept)
+
+* Responsibility
+
+- M must have an associated P to execute Go code, however it can be blocked or in a syscall w/o an associated P.
+- Gs are in P's local queue or global queue
+- G keeps current task status, provides stack
+
+* GOMAXPROCS
+
+- Number of P
+.code test/go_src.go /STARTPINIT/,/STOPPINIT/
+
+* Don't call GOMAXPROCS in runtime (when possible)
+
+.code test/go_src.go /STARTGOMAXPROCS/,/STOPGOMAXPROCS/
+
+* G -- goroutine
+
+- Created in user-space
+- Initial 2 KB stack space
+- created by
+	func newproc(siz int32, fn *funcval) {
+		...
+
+* goroutine numbers
+
+- Why Go allows us to create goroutines so easily
+
+.code test/go_src.go /STARTNEWPROC1/,/STOPNEWPROC1/
+
+- Goroutines will be reused
+
+* M -- thread
+
+- Initialization
+.code test/go_src.go /STARTINITM/,/STOPINITM/
+
+* P -- processor
+
+- Max value (?)
+	1 << 8
+- P will try to put newly created G into its local queue first, if local queue is full, P will put the new G to global queue (lock)
+
+* Workflow
+
+.code test/go_src.go /STARTWORKFLOW/,/STOPWORKFLOW/
+
+* Runtime Scheduler
+
+- How to efficiently distribute tasks
+- Work Sharing VS Work Stealing
+
+* Work sharing
+
+- Whenever a processor generates new threads, the scheduler attempts to migrate some of them to other processors.
+- in hopes of distributing the work to underutilized processors
+
+* Work Stealing
+
+- Underutilized processors take the initiative
+- Processors needing work steal computational threads from other processors
+
+* Compare
+
+- Intuitively, the migration of threads occurs less frequently with work stealing than sharing
+- When all processors have work to do, no threads are migrated by a work-stealing scheduler
+- Threads are always migrated by a work-sharing scheudler
+
+* Work Stealing Algorithms
+
+* Busy-Leaves Algorithm
+
+0. There is gloabl ready thread pool.
+1. At the beginning of each step, each processor either is idle or has a thread to work on
+2. Those processors that are idle begin the step by attempting to remove any ready thread from the pool.
+- 2.1 If there are sufficiently many ready threads in the pool to satisfy all of the idle processors, then every idle processor gets a ready thread to work on
+- 2.2 Otherwise, some processors remain idle.
+3. Then each processor that has a thread to work on executes the next instruction from that thread until the thread either spawns, stalls or dies.
+
+* Randomized work-stealing algorithm
+
+0. The centralized thread pool of Busy-Leaves Algorithm is distributed across the processors.
+1. Each processor maintains a ready deque data structure of threads.
+2. A processor obtains work by removing the thread at the bottom of its ready deque.
+3. The Work-Stealing Algorithm begines work stealing when ready deques empty.
+- 3.1 The processor becomes a *thief* and attempts to steal work from a *victim* processor chosen uniformly at random.
+- 3.2 The *thief* queries the ready deque of the *victim*, and if it is nonempty, the thief removes and begins work on the top thread.
+- 3.3 If the victim's ready deque is empty, however, the thief tries again, picking another victim at random.
+
+* Reminder -- Go Runtime Entities
+
+- M must have an associated P to execute Go code, however it can be blocked or in a syscall w/o an associated P.
+- Gs are in P's local queue or global queue
+- G keeps current task status, provides stack
+
+- Implements both Busy-Leaves & Randomized Work-Stealing
+
+* goroutine queues
+
+.code test/go_src.go /STARTGOROUTINEQ/,/STOPGOROUTINEQ/
+
+* steal goroutine from global queue
+
+.code test/go_src.go /STARTSTEALGOROUTINE/,/STOPSTEALGOROUTINE/
+
+* steal goroutine from other places
+
+.code test/go_src.go /STARTSTEALGOROUTINE2/,/STOPSTEALGOROUTINE2/
+
+* Multi Threading
+
+- Go programs are naturally multithreading programs
+- All the pros and cons of multithreading programs apply
+
+* Latency Numbers
+
+.image latency_numbers.png 512 933
+
+* NUMA
+
+.image numa.png 482 509
+
+- [[https://www.akkadia.org/drepper/cpumemory.pdf][What every programmer should know about memory]]
+
+* NUMA Aware Go Scheduler
+
+.image numa_go.png 456 431
+
+- Global resources (MHeap, global RunQ and pool of M's) are partitioned between NUMA nodes; netpoll and timers become distributed per-P.
+
+* Discusson
+
+* References
+
+- [[https://docs.google.com/document/d/1TTj4T2JO42uD5ID9e89oa0sLKhJYD0Y_kqxDv3I3XMw/edit#][Scalable Go Scheduler Design Doc]]
+- [[https://docs.google.com/document/d/1ETuA2IOmnaQ4j81AtTGT40Y4_Jr6_IDASEKg0t0dBR8/edit][Go Preemptive Scheduler Design Doc]]
+- [[http://supertech.csail.mit.edu/papers/steal.pdf][Scheduling Multithreaded Computations by Work Stealing]]
+- [[https://www.akkadia.org/drepper/cpumemory.pdf][What every programmer should know about memory]]
